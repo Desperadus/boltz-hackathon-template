@@ -14,10 +14,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   python3-venv \
   python3-dev \
   wget \
+  tar \
   && wget --no-check-certificate --no-hsts https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/${MINIFORGE_NAME}-${MINIFORGE_VERSION}-Linux-$(uname -m).sh -O miniforge.sh \
   && bash miniforge.sh -b -p /opt/conda \
   && rm miniforge.sh \
   && /opt/conda/bin/mamba init bash
+
+# Download and extract P2Rank
+RUN mkdir -p /opt/p2rank && \
+    wget https://github.com/rdk/p2rank/releases/download/2.5/p2rank_2.5.tar.gz -O /tmp/p2rank.tar.gz && \
+    tar -xzf /tmp/p2rank.tar.gz -C /opt/p2rank --strip-components=1 && \
+    rm /tmp/p2rank.tar.gz
 
 WORKDIR /app
 COPY environment.yml /app/
@@ -35,6 +42,7 @@ RUN /opt/conda/bin/mamba env create -f environment.yml --name boltz && \
 
 FROM ${BASE_IMAGE}
 COPY --from=builder /opt/conda /opt/conda
+COPY --from=builder /opt/p2rank /opt/p2rank
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
   python3 \
@@ -44,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
-ENV PATH="/opt/conda/bin:$PATH" \
+ENV PATH="/opt/conda/bin:/opt/p2rank:$PATH" \
   LANG=C.UTF-8 \
   PYTHONUNBUFFERED=1
 
@@ -56,14 +64,11 @@ RUN groupadd --gid $GID $USERNAME && \
 
 WORKDIR /app
 
-# Copy everything
 COPY . /app/
-
 RUN chown -R $USERNAME:$USERNAME /app
 
 USER $USERNAME
 
-# Initialize mamba and activate the boltz environment
 SHELL ["/bin/bash", "-c"]
 RUN mamba init bash && \
     echo "mamba activate boltz" >> ~/.bashrc

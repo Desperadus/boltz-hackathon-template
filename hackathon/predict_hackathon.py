@@ -11,9 +11,40 @@ from typing import Any, List, Optional
 import yaml
 from hackathon_api import Datapoint, Protein, SmallMolecule
 
+import csv
+import math
+from copy import deepcopy
+
+
+DEFAULT_OUT_DIR = Path("predictions")
+DEFAULT_SUBMISSION_DIR = Path("submission")
+DEFAULT_INPUTS_DIR = Path("inputs")
+
+P2RANK_HOME = "/opt/p2rank/"
+TOP_K_POCKETS = int(os.environ.get("TOP_K_POCKETS", "5"))
+POCKET_RES_MAX = int(os.environ.get("POCKET_RES_MAX", "24"))
+
+# How many pockets to generate YAMLs for (default uses your old TOP_K_POCKETS)
+TOP_N_POCKETS = int(os.environ.get("TOP_N_POCKETS", str(TOP_K_POCKETS)))
+POCKET_MAX_DISTANCE = float(os.environ.get("POCKET_MAX_DISTANCE", "10"))  # Å
+POCKET_FORCE = os.environ.get("POCKET_FORCE", "true").lower() in ("1", "true", "yes")
+
+# Ranking weights: composite = w_iptm * iptm + w_bind * bind_prob - w_aff * affinity_pred_value
+RANK_W_IPTM = float(os.environ.get("RANK_W_IPTM", "0.6"))
+RANK_W_BINDPROB = float(os.environ.get("RANK_W_BINDPROB", "0.3"))
+RANK_W_AFFINITY = float(os.environ.get("RANK_W_AFFINITY", "0.1"))
+
+# Sampling knobs
+DIFFUSION_SAMPLES = int(os.environ.get("DIFFUSION_SAMPLES", "1"))
+DIFFUSION_SAMPLES_AFFINITY = int(os.environ.get("DIFFUSION_SAMPLES_AFFINITY", "2"))
+SAMPLING_STEPS_AFFINITY = int(os.environ.get("SAMPLING_STEPS_AFFINITY", "200"))
+USE_POTENTIALS = os.environ.get("USE_POTENTIALS", "true").lower() in ("1", "true", "yes")
+AFFINITY_MW_CORRECTION = os.environ.get("AFFINITY_MW_CORRECTION", "true").lower() in ("1","true","yes")
+
 # ---------------------------------------------------------------------------
 # ---- Participants should modify these four functions ----------------------
 # ---------------------------------------------------------------------------
+
 
 def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
@@ -50,56 +81,116 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
 
 def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[SmallMolecule], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
-    Prepare input dict and CLI args for a protein-ligand prediction.
-    You can return multiple configurations to run by returning a list of (input_dict, cli_args) tuples.
-    Args:
-        datapoint_id: The unique identifier for this datapoint
-        protein: The protein sequence
-        ligands: A list of a single small molecule ligand object 
-        input_dict: Prefilled input dict
-        msa_dir: Directory containing MSA files (for computing relative paths)
-    Returns:
-        List of tuples of (final input dict that will get exported as YAML, list of CLI args). Each tuple represents a separate configuration to run.
+    For a single-chain protein + single small-molecule ligand:
+      1) run apo -> p2rank
+      2) create one YAML per top-N pockets with pocket constraint
+      3) enable affinity property
+      4) return corresponding CLI args for Boltz-2
     """
-    # Please note:
-    # `protein` is a single-chain target protein sequence with id A
-    # `ligands` contains a single small molecule ligand object with unknown binding sites
-    # you can modify input_dict to change the input yaml file going into the prediction, e.g.
-    # ```
-    # input_dict["constraints"] = [{
-    #   "contact": {
-    #       "token1" : [CHAIN_ID, RES_IDX/ATOM_NAME], 
-    #       "token1" : [CHAIN_ID, RES_IDX/ATOM_NAME]
-    #   }
-    # }]
-    # ```
-    #
-    # will add contact constraints to the input_dict
+    if len(ligands) != 1:
+        raise ValueError("Expected a single ligand for protein_ligand task.")
+    ligand = ligands[0]
+    ligand_chain = ligand.id
 
-    # Example: predict 5 structures
-    cli_args = ["--diffusion_samples", "5"]
-    return [(input_dict, cli_args)]
+    # 1) quick apo to get PDB for p2rank
+    apo_pdb = _run_boltz_protein_only_apo(datapoint_id, protein, msa_dir, args.intermediate_dir)
 
-def post_process_protein_complex(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
+    # 2) p2rank on apo, pick top-N pockets
+    p2_out = args.intermediate_dir / "p2rank" / datapoint_id
+    pockets_csv = _run_p2rank(apo_pdb, p2_out)
+    pockets = _load_p2rank_pockets(pockets_csv)
+    if not pockets:
+        raise RuntimeError("No pockets found by p2rank.")
+
+    chosen = pockets[:TOP_N_POCKETS]
+    print(f"Using top {len(chosen)} pocket(s): ranks {[p['rank'] for p in chosen]}")
+
+    # Base CLI args
+    cli_base = [
+        "--diffusion_samples", str(DIFFUSION_SAMPLES),
+        "--diffusion_samples_affinity", str(DIFFUSION_SAMPLES_AFFINITY),
+        "--sampling_steps_affinity", str(SAMPLING_STEPS_AFFINITY),
+        "--output_format", "pdb",
+        "--no_kernels",
+    ]
+    if USE_POTENTIALS:
+        cli_base.append("--use_potentials")
+    if AFFINITY_MW_CORRECTION:
+        cli_base.append("--affinity_mw_correction")
+
+    configs: List[tuple[dict, List[str]]] = []
+
+    for pk_idx, pk in enumerate(chosen):
+        cfg = deepcopy(input_dict)
+
+        # ensure constraints list
+        if "constraints" not in cfg or cfg["constraints"] is None:
+            cfg["constraints"] = []
+
+        # add pocket
+        cfg["constraints"].append(_make_pocket_constraint(ligand_chain, pk["residues"]))
+
+        # ensure properties + affinity
+        props = cfg.setdefault("properties", [])
+        # remove any previous affinity entries to avoid duplicates
+        props = [p for p in props if "affinity" not in p]
+        props.append({"affinity": {"binder": ligand_chain}})
+        cfg["properties"] = props
+        configs.append((cfg, list(cli_base)))  # independent list
+
+    return configs
+
+def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
-    Return ranked model files for protein complex submission.
-    Args:
-        datapoint: The original datapoint object
-        input_dicts: List of input dictionaries used for predictions (one per config)
-        cli_args_list: List of command line arguments used for predictions (one per config)
-        prediction_dirs: List of directories containing prediction results (one per config)
-    Returns: 
-        Sorted pdb file paths that should be used as your submission.
+    Rank all produced models with:
+      score = RANK_W_IPTM * iptm + RANK_W_BINDPROB * affinity_probability_binary - RANK_W_AFFINITY * affinity_pred_value
+    Higher is better. Returns model paths sorted by score desc.
     """
-    # Collect all PDBs from all configurations
-    all_pdbs = []
-    for prediction_dir in prediction_dirs:
-        config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
-        all_pdbs.extend(config_pdbs)
+    scored: list[tuple[float, Path]] = []
 
-    # Sort all PDBs and return their paths
-    all_pdbs = sorted(all_pdbs)
-    return all_pdbs
+    for config_idx, prediction_dir in enumerate(prediction_dirs):
+        base = f"{datapoint.datapoint_id}_config_{config_idx}"
+        # per-config folder like .../predictions/<base>/
+        pred_glob = sorted(prediction_dir.glob(f"{base}_model_*.pdb"))
+        if not pred_glob:
+            # also support mmcif in case user changed output_format
+            pred_glob = sorted(prediction_dir.glob(f"{base}_model_*.cif"))
+
+        # affinity JSON is per-input (no model index)
+        affinity_json = prediction_dir / f"affinity_{base}.json"
+        bind_prob = 0.0
+        aff_value = float("inf")
+        if affinity_json.exists():
+            try:
+                with open(affinity_json) as f:
+                    aff = json.load(f)
+                bind_prob = float(aff.get("affinity_probability_binary", 0.0))
+                aff_value = float(aff.get("affinity_pred_value", float("inf")))
+            except Exception as e:
+                print(f"WARNING: failed reading {affinity_json}: {e}")
+
+        for model_path in pred_glob:
+            # confidence JSON is per-model
+            conf_json = prediction_dir / f"confidence_{model_path.stem}.json"  # stem includes base_model_k
+            iptm = 0.0
+            if conf_json.exists():
+                try:
+                    with open(conf_json) as f:
+                        cj = json.load(f)
+                    iptm = float(cj.get("iptm", 0.0))
+                except Exception as e:
+                    print(f"WARNING: failed reading {conf_json}: {e}")
+
+            score = RANK_W_IPTM * iptm + RANK_W_BINDPROB * bind_prob - RANK_W_AFFINITY * aff_value
+            scored.append((score, model_path))
+            print(f"[rank] cfg {config_idx} | {model_path.name} -> iptm={iptm:.3f} bindP={bind_prob:.3f} affVal={aff_value:.3f} score={score:.3f}")
+
+    if not scored:
+        raise FileNotFoundError(f"No model files found for {datapoint.datapoint_id}")
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    # Return only paths, descending by score
+    return [p for _, p in scored]
 
 def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
@@ -127,9 +218,7 @@ def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str
 # -----------------------------------------------------------------------------
 
 
-DEFAULT_OUT_DIR = Path("predictions")
-DEFAULT_SUBMISSION_DIR = Path("submission")
-DEFAULT_INPUTS_DIR = Path("inputs")
+
 
 ap = argparse.ArgumentParser(
     description="Hackathon scaffold for Boltz predictions",
@@ -201,6 +290,145 @@ def _prefill_input_dict(datapoint_id: str, proteins: Iterable[Protein], ligands:
     }
     return doc
 
+def _run_boltz_protein_only_apo(datapoint_id: str, protein: Protein, msa_dir: Optional[Path], intermediate_dir: Path) -> Path:
+    """
+    Runs a quick protein-only Boltz prediction to obtain an apo PDB.
+    Returns path to the best (or first) apo model PDB.
+    """
+    input_dir = intermediate_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = intermediate_dir / "predictions"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Minimal YAML: one protein, no ligands
+    apo_yaml = input_dir / f"{datapoint_id}_apo.yaml"
+    apo_doc = _prefill_input_dict(datapoint_id, [protein], ligands=None, msa_dir=msa_dir)
+    with open(apo_yaml, "w") as f:
+        yaml.safe_dump(apo_doc, f, sort_keys=False)
+
+    cache = os.environ.get("BOLTZ_CACHE", str(Path.home() / ".boltz"))
+    cmd = [
+        "boltz", "predict", str(apo_yaml),
+        "--devices", "1",
+        "--out_dir", str(out_dir),
+        "--cache", cache,
+        "--no_kernels",
+        "--use_potentials",
+        "--output_format", "pdb",
+        "--diffusion_samples", "1",          # fast apo
+    ]
+    print("Running apo prediction:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
+    # Find first produced apo model
+    # Matches scaffold’s output folder layout:
+    apo_dir_glob = list((out_dir).glob(f"boltz_results_{datapoint_id}_apo*/predictions/*"))
+    if not apo_dir_glob:
+        # try standard name we used
+        apo_dir_glob = list((out_dir).glob(f"boltz_results_{datapoint_id}_apo/predictions/*"))
+    if not apo_dir_glob:
+        # fallback: any predictions subfolder for this datapoint
+        apo_dir_glob = list((out_dir).glob(f"boltz_results_{datapoint_id}*/predictions/*"))
+
+    pdbs = []
+    for d in apo_dir_glob:
+        pdbs.extend(sorted(d.glob("*.pdb")))
+    if not pdbs:
+        raise FileNotFoundError(f"No apo PDBs found for {datapoint_id}")
+
+    return pdbs[0]
+
+def _run_p2rank(pdb_path: Path, out_dir: Path) -> Path:
+    """
+    Runs p2rank and returns path to its main pockets CSV.
+    """
+    if P2RANK_HOME is None:
+        raise EnvironmentError("P2RANK_HOME is not set. Please export P2RANK_HOME to your p2rank installation.")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p2rank_script = "prank"
+    cmd = [str(Path(P2RANK_HOME) / p2rank_script), "predict", "-f", str(pdb_path), "-o", str(out_dir)]
+    print("Running p2rank:", " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
+    csv_candidates = list(out_dir.glob("*_predictions.csv"))
+    if not csv_candidates:
+        raise FileNotFoundError("p2rank pockets CSV not found.")
+    return csv_candidates[0]
+
+def _load_p2rank_pockets(csv_path: Path):
+    """
+    Parse p2rank *_predictions.csv and return list of pocket dicts:
+    [{'rank': int, 'score': float, 'prob': float, 'center': (x,y,z),
+      'residues': [(chain, resi-int), ...]}, ...] (sorted by rank asc)
+    """
+    def _parse_res_list(s: str):
+        out = []
+        if not s:
+            return out
+        for tok in s.replace(",", " ").split():
+            tok = tok.strip()
+            # Accept A_133 or A:133 or A-133
+            for sep in ("_", ":", "-"):
+                if sep in tok:
+                    ch, idx = tok.split(sep, 1)
+                    try:
+                        out.append((ch.strip(), int(idx)))
+                    except ValueError:
+                        pass
+                    break
+        # de-dup while preserving order
+        seen = set()
+        uniq = []
+        for ch, i in out:
+            key = (ch, i)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(key)
+        return uniq
+
+    pockets = []
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        reader.fieldnames = [name.strip() for name in reader.fieldnames]
+        for row in reader:
+            row = {k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+            try:
+                rk = int(row.get("rank"))
+            except Exception:
+                continue
+            score = float(row.get("score", "nan")) if row.get("score") else float("nan")
+            prob = float(row.get("probability", "nan")) if row.get("probability") else float("nan")
+            cx = float(row.get("center_x", "nan")) if row.get("center_x") else float("nan")
+            cy = float(row.get("center_y", "nan")) if row.get("center_y") else float("nan")
+            cz = float(row.get("center_z", "nan")) if row.get("center_z") else float("nan")
+            residues = _parse_res_list(row.get("residue_ids", ""))
+            # cap number of residues per pocket
+            residues = residues[:POCKET_RES_MAX]
+            pockets.append({
+                "rank": rk,
+                "score": score,
+                "prob": prob,
+                "center": (cx, cy, cz),
+                "residues": residues,
+            })
+    pockets.sort(key=lambda x: x["rank"])
+    return pockets
+
+def _make_pocket_constraint(ligand_chain_id: str, residues: list[tuple[str, int]]) -> dict:
+    """
+    Build a Boltz pocket constraint from residues [(chain, idx), ...].
+    """
+    contacts = [[ch, int(idx)] for ch, idx in residues]
+    return {
+        "pocket": {
+            "binder": ligand_chain_id,
+            "contacts": contacts,
+            "max_distance": POCKET_MAX_DISTANCE,
+            "force": POCKET_FORCE,
+        }
+    }
+    
 def _run_boltz_and_collect(datapoint) -> None:
     """
     New flow: prepare input dict, write yaml, run boltz, post-process, copy submissions.
@@ -232,7 +460,7 @@ def _run_boltz_and_collect(datapoint) -> None:
         # Write input YAML with config index suffix
         yaml_path = input_dir / f"{datapoint.datapoint_id}_config_{config_idx}.yaml"
         with open(yaml_path, "w") as f:
-            yaml.safe_dump(input_dict, f, sort_keys=False)
+            yaml.safe_dump(input_dict, f, sort_keys=False, default_flow_style=True)
 
         # Run boltz
         cache = os.environ.get("BOLTZ_CACHE", str(Path.home() / ".boltz"))

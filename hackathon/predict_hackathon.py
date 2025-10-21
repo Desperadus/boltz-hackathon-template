@@ -26,17 +26,17 @@ POCKET_RES_MAX = int(os.environ.get("POCKET_RES_MAX", "24"))
 
 # How many pockets to generate YAMLs for (default uses your old TOP_K_POCKETS)
 TOP_N_POCKETS = int(os.environ.get("TOP_N_POCKETS", str(TOP_K_POCKETS)))
-POCKET_MAX_DISTANCE = float(os.environ.get("POCKET_MAX_DISTANCE", "10"))  # Å
-POCKET_FORCE = os.environ.get("POCKET_FORCE", "true").lower() in ("1", "true", "yes")
+POCKET_MAX_DISTANCE = float(os.environ.get("POCKET_MAX_DISTANCE", "12"))  # Å
+POCKET_FORCE = os.environ.get("POCKET_FORCE", "false").lower() in ("1", "true", "yes")
 
 # Ranking weights: composite = w_iptm * iptm + w_bind * bind_prob - w_aff * affinity_pred_value
 RANK_W_IPTM = float(os.environ.get("RANK_W_IPTM", "0.6"))
-RANK_W_BINDPROB = float(os.environ.get("RANK_W_BINDPROB", "0.3"))
+RANK_W_BINDPROB = float(os.environ.get("RANK_W_BINDPROB", "0.4"))
 RANK_W_AFFINITY = float(os.environ.get("RANK_W_AFFINITY", "0.1"))
 
 # Sampling knobs
 DIFFUSION_SAMPLES = int(os.environ.get("DIFFUSION_SAMPLES", "1"))
-DIFFUSION_SAMPLES_AFFINITY = int(os.environ.get("DIFFUSION_SAMPLES_AFFINITY", "2"))
+DIFFUSION_SAMPLES_AFFINITY = int(os.environ.get("DIFFUSION_SAMPLES_AFFINITY", "1"))
 SAMPLING_STEPS_AFFINITY = int(os.environ.get("SAMPLING_STEPS_AFFINITY", "200"))
 USE_POTENTIALS = os.environ.get("USE_POTENTIALS", "true").lower() in ("1", "true", "yes")
 AFFINITY_MW_CORRECTION = os.environ.get("AFFINITY_MW_CORRECTION", "true").lower() in ("1","true","yes")
@@ -111,7 +111,7 @@ def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[Sm
         "--diffusion_samples_affinity", str(DIFFUSION_SAMPLES_AFFINITY),
         "--sampling_steps_affinity", str(SAMPLING_STEPS_AFFINITY),
         "--output_format", "pdb",
-        "--no_kernels",
+        # "--no_kernels",
     ]
     if USE_POTENTIALS:
         cli_base.append("--use_potentials")
@@ -140,11 +140,13 @@ def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[Sm
 
     return configs
 
+
 def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
     Rank all produced models with:
       score = RANK_W_IPTM * iptm + RANK_W_BINDPROB * affinity_probability_binary - RANK_W_AFFINITY * affinity_pred_value
     Higher is better. Returns model paths sorted by score desc.
+    If fewer than 5 models are found, duplicate the best ones to return at least 5.
     """
     scored: list[tuple[float, Path]] = []
 
@@ -166,6 +168,7 @@ def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str
                     aff = json.load(f)
                 bind_prob = float(aff.get("affinity_probability_binary", 0.0))
                 aff_value = float(aff.get("affinity_pred_value", float("inf")))
+                print(f"Bind_prob {bind_prob}")
             except Exception as e:
                 print(f"WARNING: failed reading {affinity_json}: {e}")
 
@@ -177,11 +180,12 @@ def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str
                 try:
                     with open(conf_json) as f:
                         cj = json.load(f)
-                    iptm = float(cj.get("iptm", 0.0))
+                    iptm = float(cj.get("iptm"))
+                    print(f"iPTm {iptm}")
                 except Exception as e:
                     print(f"WARNING: failed reading {conf_json}: {e}")
 
-            score = RANK_W_IPTM * iptm + RANK_W_BINDPROB * bind_prob - RANK_W_AFFINITY * aff_value
+            score = RANK_W_IPTM * iptm + RANK_W_BINDPROB * bind_prob
             scored.append((score, model_path))
             print(f"[rank] cfg {config_idx} | {model_path.name} -> iptm={iptm:.3f} bindP={bind_prob:.3f} affVal={aff_value:.3f} score={score:.3f}")
 
@@ -189,29 +193,18 @@ def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str
         raise FileNotFoundError(f"No model files found for {datapoint.datapoint_id}")
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    # Return only paths, descending by score
-    return [p for _, p in scored]
+    ranked_paths = [p for _, p in scored]
 
-def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
-    """
-    Return ranked model files for protein-ligand submission.
-    Args:
-        datapoint: The original datapoint object
-        input_dicts: List of input dictionaries used for predictions (one per config)
-        cli_args_list: List of command line arguments used for predictions (one per config)
-        prediction_dirs: List of directories containing prediction results (one per config)
-    Returns: 
-        Sorted pdb file paths that should be used as your submission.
-    """
-    # Collect all PDBs from all configurations
-    all_pdbs = []
-    for prediction_dir in prediction_dirs:
-        config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
-        all_pdbs.extend(config_pdbs)
-    
-    # Sort all PDBs and return their paths
-    all_pdbs = sorted(all_pdbs)
-    return all_pdbs
+    # Pad to at least 5 by duplicating from the top in order
+    if len(ranked_paths) < 5:
+        orig = ranked_paths[:]  # preserve original ranking
+        k = 0
+        while len(ranked_paths) < 5 and orig:
+            ranked_paths.append(orig[k % len(orig)])
+            k += 1
+
+    # Return sorted paths (could be >5; caller already slices to top 5)
+    return ranked_paths[:5]
 
 # -----------------------------------------------------------------------------
 # ---- End of participant section ---------------------------------------------

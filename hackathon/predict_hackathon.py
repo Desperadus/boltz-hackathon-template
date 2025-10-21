@@ -123,19 +123,24 @@ def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[Sm
     for pk_idx, pk in enumerate(chosen):
         cfg = deepcopy(input_dict)
 
-        # ensure constraints list
-        if "constraints" not in cfg or cfg["constraints"] is None:
-            cfg["constraints"] = []
-
-        # add pocket
-        cfg["constraints"].append(_make_pocket_constraint(ligand_chain, pk["residues"]))
-
         # ensure properties + affinity
         props = cfg.setdefault("properties", [])
         # remove any previous affinity entries to avoid duplicates
         props = [p for p in props if "affinity" not in p]
         props.append({"affinity": {"binder": ligand_chain}})
         cfg["properties"] = props
+        if pk_idx == 0: # add it once without constrains
+            print(cfg)
+            configs.append((cfg, list(cli_base)))
+            cfg = deepcopy(cfg)
+
+        # ensure constraints list
+        if "constraints" not in cfg or cfg["constraints"] is None:
+            cfg["constraints"] = []
+
+        # add pocket
+        cfg["constraints"].append(_make_pocket_constraint(ligand_chain, pk["residues"]))
+        
         configs.append((cfg, list(cli_base)))  # independent list
 
     return configs
@@ -305,7 +310,7 @@ def _run_boltz_protein_only_apo(datapoint_id: str, protein: Protein, msa_dir: Op
         "--devices", "1",
         "--out_dir", str(out_dir),
         "--cache", cache,
-        "--no_kernels",
+        # "--no_kernels",
         "--use_potentials",
         "--output_format", "pdb",
         "--diffusion_samples", "1",          # fast apo
@@ -421,6 +426,16 @@ def _make_pocket_constraint(ligand_chain_id: str, residues: list[tuple[str, int]
             "force": POCKET_FORCE,
         }
     }
+
+def _make_pocket_noconstraint(ligand_chain_id: str) -> dict:
+    """
+    Build a Boltz pocket constraint from residues [(chain, idx), ...].
+    """
+    return {
+        "pocket": {
+            "binder": ligand_chain_id,
+        }
+    }
     
 def _run_boltz_and_collect(datapoint) -> None:
     """
@@ -462,7 +477,7 @@ def _run_boltz_and_collect(datapoint) -> None:
             "--devices", "1",
             "--out_dir", str(out_dir),
             "--cache", cache,
-            "--no_kernels",
+            # "--no_kernels",
             "--output_format", "pdb",
         ]
         cmd = fixed + cli_args

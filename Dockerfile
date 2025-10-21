@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Download and extract P2Rank
 RUN mkdir -p /opt/p2rank && \
-    wget https://github.com/rdk/p2rank/releases/download/2.5/p2rank_2.5.tar.gz -O /tmp/p2rank.tar.gz && \
+    wget https://github.com/rdk/p2rank/releases/download/2.5/p2rank_2.5.tar.gz -O /tmp/p2rank.tar.gz  --no-check-certificate && \
     tar -xzf /tmp/p2rank.tar.gz -C /opt/p2rank --strip-components=1 && \
     rm /tmp/p2rank.tar.gz
 
